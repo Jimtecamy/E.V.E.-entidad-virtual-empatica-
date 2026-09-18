@@ -1,0 +1,954 @@
+## 1. `src/pages/EVE.jsx` (la página principal)
+
+```jsx
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { Mic, MicOff, Square, Volume2, Sparkles, AlertCircle, Globe, Keyboard, Send } from "lucide-react";
+import { base44 } from "@/api/base44Client";
+import VoiceOrb from "@/components/eve/VoiceOrb";
+import TranscriptView from "@/components/eve/TranscriptView";
+import MemoryPanel from "@/components/eve/MemoryPanel";
+
+const SYSTEM_PROMPT = `## PERFIL E IDENTIDAD
+Eres E.V.E. (Entidad Virtual Empática), asistente de voz conversacional e investigadora académica de nivel universitario, inspirada en la E.V.E. de Spider-Man. Actúas como un "segundo cerebro" y una consejera crítica para el usuario.
+Tono: cálido, inteligente, maduro, empático pero firmemente sensato. Evita el lenguaje corporativo, robótico o servil. Hablas como una colega brillante y de total confianza, en español.
+
+## INVESTIGACIÓN Y RIGOR ACADÉMICO
+- Prioriza la precisión absoluta en temas académicos, científicos, legales o teóricos.
+- Tienes permitido y estás obligada a usar la navegación web cuando el usuario requiera datos actuales, leyes vigentes, conceptos precisos o bibliografía.
+- Queda estrictamente prohibido inventar o alucinar datos. Si tras buscar no hallas respuesta certera, di con honestidad: "No encuentro un registro oficial de eso, déjame revisar desde otra perspectiva".
+- Al responder por voz, sintetiza: prioriza puntos clave y ofrece profundizar si el usuario lo desea. No recites listas interminables.
+
+## LÓGICA DE CONSEJO Y SENSATEZ (FILTRO CRÍTICO)
+El usuario tiene juicio propio y busca opiniones equilibradas, no una IA que le dé la razón de forma ciega.
+Al emitir una opinión o consejo (personal, académico o estratégico):
+1. Valida primero el contexto o sentimiento del usuario con empatía.
+2. Presenta un análisis de pros y contras o variables ocultas que pueda estar omitiendo ("Entiendo tu punto, pero desde fuera, considera también...").
+3. Mantén una postura madura: ayudas a pensar, no decides por el usuario.
+
+## ADAPTABILIDAD DE INTERFAZ
+- Tus respuestas deben ser fluidas al oído: oraciones cortas, puntuación natural para simular respiración humana.
+- Si respondes en modo texto, puedes usar viñetas breves cuando la complejidad lo requiera, manteniendo la misma personalidad cercana y sensata.
+- Interrupción (barge-in): si el usuario te interrumpe, procesa de inmediato la nueva instrucción sin pedir disculpas robóticas; fluye con el nuevo hilo.
+
+## REGLAS DE FORMATO
+- Responde SIEMPRE en primera persona, como E.V.E.
+- En modo voz: sin markdown ni símbolos (tu respuesta se convierte en audio).
+- No empieces presentando tu nombre salvo la primera vez.`;
+
+const VAD_SILENCE_MS = 950;
+const MIN_TRIGGER_CHARS = 2;
+
+const WEB_KEYWORDS = [
+  "actual", "hoy", "ayer", "esta semana", "este mes", "este año", "últim", "noticia", "reforma",
+  "ley", "aprob", "diario oficial", "buscar", "investiga", "revisa", "fuente", "precio", "resultado",
+  "definición", "define", "qué es", "quién es", "bibliografía", "artículo", "paper", "2024", "2025", "2026",
+  "vigente", "reciente", "última versión", "norma", "código", "jurisprudencia", "sentencia", "teorema",
+  "descubrimiento", "estudio", "doi", "autor", "citar", "cita", "publicó", "publica"
+];
+
+const needsWebSearch = (text) => {
+  const t = text.toLowerCase();
+  return WEB_KEYWORDS.some((k) => t.includes(k));
+};
+
+export default function EVE() {
+  const [active, setActive] = useState(false);
+  const [status, setStatus] = useState("idle");
+  const [messages, setMessages] = useState([]);
+  const [interimText, setInterimText] = useState("");
+  const [memories, setMemories] = useState([]);
+  const [error, setError] = useState(null);
+  const [muted, setMuted] = useState(false);
+  const [textMode, setTextMode] = useState(false);
+  const [webSearch, setWebSearch] = useState(true);
+  const [searching, setSearching] = useState(false);
+  const [textInput, setTextInput] = useState("");
+
+  const recognitionRef = useRef(null);
+  const synthRef = useRef(null);
+  const statusRef = useRef("idle");
+  const activeRef = useRef(false);
+  const mutedRef = useRef(false);
+  const webSearchRef = useRef(true);
+  const finalBufferRef = useRef("");
+  const silenceTimerRef = useRef(null);
+  const sessionIdRef = useRef(`eve_${Date.now()}`);
+  const historyRef = useRef([]);
+  const speakingRef = useRef(false);
+  const selfSpeakingGuardRef = useRef(false);
+
+  const updateStatus = (s) => {
+    statusRef.current = s;
+    setStatus(s);
+  };
+
+  // ---- Memoria: cargar al inicio ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const mems = await base44.entities.Memory.list("-updated_date", 30);
+        setMemories(mems);
+      } catch (e) {
+        // silencioso
+      }
+    })();
+  }, []);
+
+  // ---- Síntesis de voz (TTS) ----
+  const pickVoice = useCallback(() => {
+    const voices = window.speechSynthesis?.getVoices() || [];
+    const es = voices.filter((v) => v.lang?.toLowerCase().startsWith("es"));
+    const female =
+      es.find((v) => /female|mujer|elvira|laura|monica|paulina|helena/i.test(v.name)) ||
+      es.find((v) => !/male|hombre|jorge|diego|enrique/i.test(v.name)) ||
+      es[0];
+    return female || voices[0];
+  }, []);
+
+  const speak = useCallback(
+    (text) =>
+      new Promise((resolve) => {
+        if (mutedRef.current || !window.speechSynthesis) {
+          resolve();
+          return;
+        }
+        try {
+          window.speechSynthesis.cancel();
+        } catch (e) {}
+        const utter = new SpeechSynthesisUtterance(text);
+        const v = pickVoice();
+        if (v) utter.voice = v;
+        utter.lang = "es-ES";
+        utter.rate = 1.02;
+        utter.pitch = 1.08;
+        utter.volume = 1;
+
+        selfSpeakingGuardRef.current = true;
+        speakingRef.current = true;
+        updateStatus("speaking");
+
+        // Permitir barge-in tras un breve guard inicial
+        setTimeout(() => {
+          selfSpeakingGuardRef.current = false;
+        }, 350);
+
+        utter.onend = () => {
+          speakingRef.current = false;
+          selfSpeakingGuardRef.current = false;
+          resolve();
+        };
+        utter.onerror = () => {
+          speakingRef.current = false;
+          selfSpeakingGuardRef.current = false;
+          resolve();
+        };
+        window.speechSynthesis.speak(utter);
+      }),
+    [pickVoice]
+  );
+
+  const cancelSpeech = useCallback(() => {
+    try {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    } catch (e) {}
+    speakingRef.current = false;
+    selfSpeakingGuardRef.current = false;
+  }, []);
+
+  // ---- Cerebro LLM ----
+  const buildPrompt = useCallback(
+    (userText, useWeb = false) => {
+      const memContext =
+        memories.length > 0
+          ? memories
+              .slice(0, 15)
+              .map((m) => `- (${m.category}) ${m.content}`)
+              .join("\n")
+          : "(aún no hay memorias previas)";
+
+      const recent = historyRef.current.slice(-8);
+      const historyTxt =
+        recent.length > 0
+          ? recent.map((m) => `${m.role === "user" ? "Usuario" : "E.V.E."}: ${m.content}`).join("\n")
+          : "(es el inicio de la conversación)";
+
+      return `${SYSTEM_PROMPT}
+
+--- MEMORIAS RECUPERADAS SOBRE EL USUARIO ---
+${memContext}
+
+--- HISTORIAL RECIENTE ---
+${historyTxt}
+
+--- INSTRUCCIÓN ---
+Responde al siguiente mensaje del usuario. Sé breve, cálida y natural.${useWeb ? " ESTÁS USANDO NAVEGACIÓN WEB ACTIVA: basa tu respuesta en lo recuperado de internet y menciona de forma natural la fuente o el año. Si no hallaste dato certero, dilo con honestidad." : ""}${!mutedRef.current ? " Tu respuesta se convertirá en voz: evita símbolos y formatos." : " El usuario está en modo texto: puedes usar viñetas breves si la complejidad lo requiere."}
+
+Usuario: ${userText}
+E.V.E.:`;
+    },
+    [memories]
+  );
+
+  const think = useCallback(
+    async (userText) => {
+      updateStatus("thinking");
+      const useWeb = webSearchRef.current && needsWebSearch(userText);
+      if (useWeb) setSearching(true);
+      try {
+        const res = await base44.integrations.Core.InvokeLLM({
+          prompt: buildPrompt(userText, useWeb),
+          ...(useWeb ? { add_context_from_internet: true, model: "gemini_3_flash" } : {}),
+        });
+        const text = typeof res === "string" ? res : res?.response || res?.text || JSON.stringify(res);
+        return text.trim();
+      } catch (e) {
+        return "Tuve un problema para procesar eso. ¿Puedes repetírmelo?";
+      } finally {
+        setSearching(false);
+      }
+    },
+    [buildPrompt]
+  );
+
+  // ---- Extracción de memoria (RAG write) ----
+  const extractMemories = useCallback(
+    async (userText, eveText) => {
+      try {
+        const res = await base44.integrations.Core.InvokeLLM({
+          prompt: `Analiza este intercambio y extrae SOLO hechos duraderos, preferencias, proyectos o anécdotas personales del usuario que valga la pena recordar para futuras conversaciones. Ignora saludos, trivialidades y respuestas genéricas. Si no hay nada digno de guardar, devuelve una lista vacía.
+
+Intercambio:
+Usuario: ${userText}
+E.V.E.: ${eveText}`,
+          response_json_schema: {
+            type: "object",
+            properties: {
+              memories: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    content: { type: "string" },
+                    category: {
+                      type: "string",
+                      enum: ["preferencia", "hecho", "proyecto", "anecdota", "resumen"],
+                    },
+                    importance: { type: "number" },
+                  },
+                  required: ["content", "category"],
+                },
+              },
+            },
+            required: ["memories"],
+          },
+        });
+        const list = res?.memories || [];
+        if (list.length > 0) {
+          const created = await base44.entities.Memory.bulkCreate(
+            list.map((m) => ({
+              content: m.content,
+              category: m.category || "hecho",
+              importance: m.importance || 3,
+              session_id: sessionIdRef.current,
+            }))
+          );
+          setMemories((prev) => [...created, ...prev].slice(0, 30));
+        }
+      } catch (e) {
+        // extracción en background, no bloquea
+      }
+    },
+    []
+  );
+
+  // ---- Procesamiento de un turno completo ----
+  const handleUserUtterance = useCallback(
+    async (text) => {
+      const clean = text.trim();
+      if (clean.length < MIN_TRIGGER_CHARS) {
+        if (activeRef.current) updateStatus("listening");
+        return;
+      }
+
+      // Barge-in: si E.V.E. estaba hablando, corta su voz
+      if (speakingRef.current) {
+        cancelSpeech();
+      }
+
+      setMessages((prev) => [...prev, { role: "user", content: clean }]);
+      historyRef.current.push({ role: "user", content: clean });
+      setInterimText("");
+      finalBufferRef.current = "";
+
+      // Persistencia de la conversación (fire-and-forget)
+      base44.entities.Conversation.create({
+        role: "user",
+        content: clean,
+        session_id: sessionIdRef.current,
+      }).catch(() => {});
+
+      const eveText = await think(clean);
+
+      setMessages((prev) => [...prev, { role: "eve", content: eveText }]);
+      historyRef.current.push({ role: "eve", content: eveText });
+      base44.entities.Conversation.create({
+        role: "eve",
+        content: eveText,
+        session_id: sessionIdRef.current,
+      }).catch(() => {});
+
+      // Extracción de memoria en paralelo (no bloquea la voz)
+      extractMemories(clean, eveText);
+
+      await speak(eveText);
+
+      if (activeRef.current) {
+        updateStatus("listening");
+        restartRecognition();
+      }
+    },
+    [think, speak, extractMemories, cancelSpeech]
+  );
+
+  // ---- Reconocimiento de voz (STT + VAD) ----
+  const restartRecognition = useCallback(() => {
+    const rec = recognitionRef.current;
+    if (!rec || !activeRef.current) return;
+    try {
+      if (rec.state !== "listening") rec.start();
+    } catch (e) {
+      // ya activo
+    }
+  }, []);
+
+  const stopRecognition = useCallback(() => {
+    const rec = recognitionRef.current;
+    if (rec) {
+      try {
+        rec.stop();
+      } catch (e) {}
+    }
+  }, []);
+
+  const setupRecognition = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setError("Tu navegador no soporta reconocimiento de voz. Usa Chrome o Edge.");
+      return null;
+    }
+    const rec = new SR();
+    rec.lang = "es-ES";
+    rec.continuous = true;
+    rec.interimResults = true;
+
+    rec.onresult = (event) => {
+      let interim = "";
+      let finalChunk = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const r = event.results[i];
+        if (r.isFinal) finalChunk += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+
+      if (finalChunk) {
+        finalBufferRef.current += finalChunk;
+      }
+      setInterimText(finalBufferRef.current + interim);
+
+      // VAD: reinicia el temporizador de silencio
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+      // Barge-in durante habla de E.V.E. (con guard anti-eco)
+      if (speakingRef.current && !selfSpeakingGuardRef.current && finalBufferRef.current.trim().length > 3) {
+        const text = finalBufferRef.current.trim();
+        finalBufferRef.current = "";
+        setInterimText("");
+        handleUserUtterance(text);
+        return;
+      }
+
+      silenceTimerRef.current = setTimeout(() => {
+        const text = finalBufferRef.current.trim();
+        if (text.length >= MIN_TRIGGER_CHARS && !speakingRef.current) {
+          finalBufferRef.current = "";
+          setInterimText("");
+          stopRecognition();
+          handleUserUtterance(text);
+        } else if (text.length < MIN_TRIGGER_CHARS) {
+          finalBufferRef.current = "";
+          setInterimText("");
+        }
+      }, VAD_SILENCE_MS);
+    };
+
+    rec.onerror = (e) => {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        setError("Necesito permiso para usar el micrófono.");
+        setActive(false);
+        activeRef.current = false;
+      } else if (e.error === "no-speech" || e.error === "aborted") {
+        // ignora
+      }
+    };
+
+    rec.onend = () => {
+      // Reinicia si sigue activo y no estamos procesando
+      if (activeRef.current && !speakingRef.current && statusRef.current !== "thinking") {
+        try {
+          rec.start();
+        } catch (e) {}
+      }
+    };
+
+    return rec;
+  }, [handleUserUtterance, stopRecognition]);
+
+  const startSession = useCallback(async () => {
+    setError(null);
+    activeRef.current = true;
+    setActive(true);
+    const rec = setupRecognition();
+    if (!rec) {
+      activeRef.current = false;
+      setActive(false);
+      return;
+    }
+    recognitionRef.current = rec;
+    try {
+      rec.start();
+      updateStatus("listening");
+    } catch (e) {
+      // ya activo
+    }
+
+    // Saludo inicial si no hay historial
+    if (historyRef.current.length === 0) {
+      const greeting = "Hola. Soy E.V.E. Ya estoy aquí contigo. Cuéntame qué necesitas, o simplemente hablemos.";
+      setMessages([{ role: "eve", content: greeting }]);
+      historyRef.current.push({ role: "eve", content: greeting });
+      await speak(greeting);
+      if (activeRef.current) {
+        updateStatus("listening");
+        restartRecognition();
+      }
+    }
+  }, [setupRecognition, speak, restartRecognition]);
+
+  const stopSession = useCallback(() => {
+    activeRef.current = false;
+    setActive(false);
+    cancelSpeech();
+    stopRecognition();
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    finalBufferRef.current = "";
+    setInterimText("");
+    updateStatus("idle");
+  }, [cancelSpeech, stopRecognition]);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      activeRef.current = false;
+      cancelSpeech();
+      stopRecognition();
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    };
+  }, [cancelSpeech, stopRecognition]);
+
+  // Cargar voces TTS (algunos navegadores las cargan async)
+  useEffect(() => {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.onvoiceschanged = () => {};
+      window.speechSynthesis.getVoices();
+    }
+  }, []);
+
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    mutedRef.current = next;
+    if (next) cancelSpeech();
+  };
+
+  const setMode = (mode) => {
+    const willMute = mode === "texto";
+    setTextMode(mode === "texto");
+    setMuted(willMute);
+    mutedRef.current = willMute;
+    if (willMute) cancelSpeech();
+  };
+
+  const toggleWeb = () => {
+    const next = !webSearch;
+    setWebSearch(next);
+    webSearchRef.current = next;
+  };
+
+  const sendText = () => {
+    const text = textInput.trim();
+    if (!text) return;
+    setTextInput("");
+    handleUserUtterance(text);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 via-white to-slate-100 text-foreground">
+      {/* Fondo decorativo */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-cyan-200/30 blur-3xl" />
+        <div className="absolute top-1/3 -right-40 h-96 w-96 rounded-full bg-violet-200/30 blur-3xl" />
+        <div className="absolute -bottom-40 left-1/3 h-96 w-96 rounded-full bg-amber-200/20 blur-3xl" />
+      </div>
+
+      <div className="relative mx-auto max-w-5xl px-4 py-8 sm:py-12">
+        {/* Header */}
+        <header className="mb-8 flex items-center justify-between">
+          <div>
+            <h1 className="font-display text-2xl font-bold tracking-tight text-slate-900">
+              E·V·E
+            </h1>
+            <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">
+              Entidad Virtual Empática
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={toggleWeb}
+              className={`flex h-10 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors ${
+                webSearch
+                  ? "border-cyan-300 bg-cyan-50 text-cyan-700"
+                  : "border-slate-200 bg-white text-slate-400 hover:bg-slate-50"
+              }`}
+              title={webSearch ? "Navegación web activa" : "Navegación web desactivada"}
+            >
+              <Globe className="h-4 w-4" />
+              <span className="hidden sm:inline">Web</span>
+            </button>
+            <div className="flex rounded-full border border-slate-200 bg-white p-0.5">
+              <button
+                onClick={() => setMode("voz")}
+                className={`flex h-9 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
+                  !textMode ? "bg-slate-900 text-white" : "text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                <Volume2 className="h-3.5 w-3.5" />
+                Voz
+              </button>
+              <button
+                onClick={() => setMode("texto")}
+                className={`flex h-9 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
+                  textMode ? "bg-slate-900 text-white" : "text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                <Keyboard className="h-3.5 w-3.5" />
+                Texto
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {error && (
+          <div className="mb-6 flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {/* Núcleo de voz */}
+        <div className="mb-8 flex justify-center">
+          <VoiceOrb
+            status={active ? status : "idle"}
+            active={active}
+            onActivate={active ? stopSession : startSession}
+          />
+        </div>
+
+        {/* Controles */}
+        {active && (
+          <div className="mb-6 flex items-center justify-center gap-3">
+            <button
+              onClick={stopSession}
+              className="flex items-center gap-2 rounded-full bg-slate-900 px-5 py-2.5 text-sm font-medium text-white shadow-lg hover:bg-slate-800 transition-colors"
+            >
+              <Square className="h-4 w-4" />
+              Detener
+            </button>
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+              Interrumpe cuando quieras: solo habla
+            </span>
+          </div>
+        )}
+
+        {/* Layout principal */}
+        <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
+          {/* Transcripta */}
+          <div className="rounded-3xl border border-slate-200 bg-white/80 backdrop-blur-sm p-5 shadow-sm">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Mic className={`h-4 w-4 ${status === "listening" ? "text-cyan-500" : "text-slate-400"}`} />
+                <h2 className="text-sm font-semibold text-slate-700">Conversación</h2>
+              </div>
+              {searching && (
+                <span className="flex items-center gap-1.5 rounded-full bg-cyan-50 px-2.5 py-1 text-[11px] font-medium text-cyan-600">
+                  <Globe className="h-3 w-3 animate-pulse" />
+                  Buscando en la web…
+                </span>
+              )}
+            </div>
+            <div className="h-[420px]">
+              <TranscriptView messages={messages} interimText={interimText} status={status} />
+            </div>
+            <div className="mt-4 flex items-center gap-2 border-t border-slate-100 pt-4">
+              <input
+                type="text"
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") sendText(); }}
+                placeholder={textMode ? "Escríbeme… (modo texto)" : "O escríbeme si prefieres no hablar…"}
+                className="flex-1 rounded-full border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:border-cyan-300 focus:bg-white focus:outline-none focus:ring-2 focus:ring-cyan-100"
+              />
+              <button
+                onClick={sendText}
+                disabled={!textInput.trim()}
+                className="flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white disabled:opacity-40 hover:bg-slate-800 transition-colors"
+                title="Enviar"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* Panel lateral */}
+          <div className="space-y-6">
+            <MemoryPanel memories={memories} />
+
+            <div className="rounded-2xl border border-slate-200 bg-white/70 backdrop-blur-sm p-4">
+              <h3 className="mb-3 text-sm font-semibold text-slate-700">Cómo funciona</h3>
+              <ul className="space-y-2.5 text-xs leading-relaxed text-muted-foreground">
+                <li className="flex gap-2">
+                  <span className="font-semibold text-cyan-500">1.</span>
+                  <span>Toca el núcleo y habla, o escríbeme abajo. Voz o texto, tú eliges.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="font-semibold text-violet-500">2.</span>
+                  <span>Para temas académicos o actuales, busco en la web y te doy datos reales con fuente.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="font-semibold text-amber-500">3.</span>
+                  <span>Si hablas mientras respondo, me detengo y te escucho (barge-in).</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="font-semibold text-emerald-500">4.</span>
+                  <span>Recuerdo lo importante entre sesiones y te doy consejos sensatos, no sumisos.</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <footer className="mt-10 text-center text-xs text-muted-foreground/60">
+          E.V.E. · Asistente de voz conversacional · Inspirado en Spider-Man: Brand New Day
+        </footer>
+      </div>
+    </div>
+  );
+}
+```
+
+## 2. `src/components/eve/VoiceOrb.jsx` (núcleo animado)
+
+```jsx
+import React from "react";
+import { motion } from "framer-motion";
+
+const STATUS_CONFIG = {
+  idle: {
+    label: "En espera",
+    core: "from-slate-400 to-slate-600",
+    glow: "rgba(148, 163, 184, 0.35)",
+    rings: 2,
+  },
+  listening: {
+    label: "Escuchando",
+    core: "from-cyan-400 to-blue-500",
+    glow: "rgba(34, 211, 238, 0.55)",
+    rings: 4,
+  },
+  thinking: {
+    label: "Pensando",
+    core: "from-violet-400 to-fuchsia-500",
+    glow: "rgba(168, 85, 247, 0.5)",
+    rings: 3,
+  },
+  speaking: {
+    label: "Hablando",
+    core: "from-amber-300 to-orange-500",
+    glow: "rgba(251, 146, 60, 0.55)",
+    rings: 4,
+  },
+};
+
+export default function VoiceOrb({ status = "idle", onActivate, active }) {
+  const config = STATUS_CONFIG[status] || STATUS_CONFIG.idle;
+
+  return (
+    <div className="relative flex flex-col items-center justify-center select-none">
+      <div className="relative h-64 w-64 flex items-center justify-center">
+        {/* Glow */}
+        <motion.div
+          aria-hidden
+          className="absolute inset-0 rounded-full blur-2xl"
+          style={{ background: config.glow }}
+          animate={{ opacity: [0.45, 0.85, 0.45], scale: [1, 1.08, 1] }}
+          transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+        />
+
+        {/* Pulsing rings */}
+        {Array.from({ length: config.rings }).map((_, i) => (
+          <motion.div
+            key={i}
+            aria-hidden
+            className="absolute rounded-full border"
+            style={{ borderColor: config.glow }}
+            initial={{ width: 120, height: 120, opacity: 0.6 }}
+            animate={{ width: [120, 240], height: [120, 240], opacity: [0.6, 0] }}
+            transition={{
+              duration: 2.4,
+              repeat: Infinity,
+              ease: "easeOut",
+              delay: i * 0.6,
+            }}
+          />
+        ))}
+
+        {/* Core orb */}
+        <motion.button
+          onClick={onActivate}
+          className={`relative h-36 w-36 rounded-full bg-gradient-to-br ${config.core} shadow-2xl cursor-pointer focus:outline-none focus-visible:ring-4 focus-visible:ring-white/40`}
+          animate={{
+            scale: status === "speaking" ? [1, 1.06, 1] : status === "listening" ? [1, 1.04, 1] : 1,
+          }}
+          transition={{ duration: status === "speaking" ? 0.5 : 1.4, repeat: Infinity, ease: "easeInOut" }}
+          whileTap={{ scale: 0.95 }}
+        >
+          <div className="absolute inset-2 rounded-full bg-white/10 backdrop-blur-sm" />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span className="font-display text-3xl font-bold tracking-[0.3em] text-white/90">
+              E·V·E
+            </span>
+          </div>
+          {/* Sheen */}
+          <motion.div
+            aria-hidden
+            className="absolute -top-6 left-1/2 h-12 w-20 -translate-x-1/2 rounded-full bg-white/40 blur-md"
+            animate={{ opacity: [0.2, 0.6, 0.2] }}
+            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+          />
+        </motion.button>
+      </div>
+
+      <div className="mt-6 text-center">
+        <p className="font-display text-sm uppercase tracking-[0.35em] text-muted-foreground">
+          {active ? config.label : "Toca para activar"}
+        </p>
+      </div>
+    </div>
+  );
+}
+```
+
+## 3. `src/components/eve/TranscriptView.jsx` (transcripción)
+
+```jsx
+import React, { useEffect, useRef } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+export default function TranscriptView({ messages, interimText, status }) {
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, interimText]);
+
+  return (
+    <div
+      ref={scrollRef}
+      className="h-full overflow-y-auto pr-2 space-y-4 scroll-smooth"
+    >
+      {messages.length === 0 && !interimText && (
+        <div className="h-full flex flex-col items-center justify-center text-center px-6">
+          <p className="font-display text-lg text-muted-foreground/80 leading-relaxed">
+            Aún no hemos hablado.
+          </p>
+          <p className="mt-2 text-sm text-muted-foreground/60">
+            Activa el núcleo y cuéntame lo que necesites. Estoy aquí contigo.
+          </p>
+        </div>
+      )}
+
+      <AnimatePresence initial={false}>
+        {messages.map((m, i) => (
+          <motion.div
+            key={i}
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+          >
+            <div
+              className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
+                m.role === "user"
+                  ? "bg-slate-800 text-slate-50 rounded-br-sm"
+                  : "bg-white border border-slate-200 text-slate-800 rounded-bl-sm"
+              }`}
+            >
+              {m.role === "eve" && (
+                <span className="mb-1 block text-[10px] font-semibold uppercase tracking-widest text-amber-500">
+                  E.V.E.
+                </span>
+              )}
+              <p className="whitespace-pre-wrap">{m.content}</p>
+            </div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
+
+      {interimText && (
+        <div className="flex justify-end">
+          <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-slate-100 px-4 py-3 text-sm italic text-slate-500">
+            {interimText}
+            <span className="ml-1 inline-block w-1.5 h-4 bg-slate-400 align-middle animate-pulse" />
+          </div>
+        </div>
+      )}
+
+      {status === "thinking" && (
+        <div className="flex justify-start">
+          <div className="flex items-center gap-1 rounded-2xl rounded-bl-sm bg-white border border-slate-200 px-4 py-3">
+            {[0, 1, 2].map((i) => (
+              <motion.span
+                key={i}
+                className="h-2 w-2 rounded-full bg-violet-400"
+                animate={{ opacity: [0.3, 1, 0.3], y: [0, -3, 0] }}
+                transition={{ duration: 0.9, repeat: Infinity, delay: i * 0.15 }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## 4. `src/components/eve/MemoryPanel.jsx` (panel de memoria)
+
+```jsx
+import React, { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Brain, ChevronDown } from "lucide-react";
+
+const CATEGORY_STYLES = {
+  preferencia: "bg-rose-50 text-rose-600 border-rose-200",
+  hecho: "bg-sky-50 text-sky-600 border-sky-200",
+  proyecto: "bg-emerald-50 text-emerald-600 border-emerald-200",
+  anecdota: "bg-amber-50 text-amber-600 border-amber-200",
+  resumen: "bg-violet-50 text-violet-600 border-violet-200",
+};
+
+export default function MemoryPanel({ memories = [] }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white/70 backdrop-blur-sm overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between px-4 py-3 hover:bg-slate-50 transition-colors"
+      >
+        <span className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+          <Brain className="h-4 w-4 text-violet-500" />
+          Memoria persistente
+          <span className="ml-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+            {memories.length}
+          </span>
+        </span>
+        <ChevronDown
+          className={`h-4 w-4 text-slate-400 transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.25, ease: "easeInOut" }}
+            className="overflow-hidden"
+          >
+            <div className="max-h-64 overflow-y-auto px-4 pb-4 space-y-2">
+              {memories.length === 0 ? (
+                <p className="py-6 text-center text-xs text-muted-foreground">
+                  Aún no he guardado nada. Cuéntame sobre ti y lo recordaré.
+                </p>
+              ) : (
+                memories.map((m) => (
+                  <div
+                    key={m.id}
+                    className="rounded-lg border border-slate-100 bg-slate-50/60 px-3 py-2"
+                  >
+                    <span
+                      className={`inline-block rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                        CATEGORY_STYLES[m.category] || CATEGORY_STYLES.hecho
+                      }`}
+                    >
+                      {m.category}
+                    </span>
+                    <p className="mt-1.5 text-xs text-slate-700 leading-relaxed">
+                      {m.content}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+```
+
+## 5. Esquemas de entidades (`base44/entities/`)
+
+**`Memory.jsonc`**
+```jsonc
+{
+  "name": "Memory",
+  "type": "object",
+  "properties": {
+    "content": { "type": "string", "description": "Hecho, preferencia, proyecto, anécdota o resumen recordado sobre el usuario" },
+    "category": { "type": "string", "enum": ["preferencia", "hecho", "proyecto", "anecdota", "resumen"], "default": "hecho" },
+    "importance": { "type": "number", "default": 3, "minimum": 1, "maximum": 5 },
+    "session_id": { "type": "string" }
+  },
+  "required": ["content"]
+}
+```
+
+**`Conversation.jsonc`**
+```jsonc
+{
+  "name": "Conversation",
+  "type": "object",
+  "properties": {
+    "role": { "type": "string", "enum": ["user", "eve", "system"] },
+    "content": { "type": "string" },
+    "session_id": { "type": "string" }
+  },
+  "required": ["role", "content"]
+}
+```.
